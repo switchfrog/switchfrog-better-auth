@@ -1,0 +1,60 @@
+{
+  "name": "@switchfrog/better-auth",
+  "version": "0.1.0",
+  "description": "Automatic Switchfrog session identity for Better Auth",
+  "license": "Apache-2.0",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsdown",
+    "dev": "pnpm build && tsc --project example/tsconfig.json && tsdown --config example/tsdown.config.mjs && node --env-file-if-exists=.env --import tsx example/server.ts",
+    "test": "vitest run tests/server.spec.ts tests/client.spec.ts",
+    "typecheck": "tsc --noEmit",
+    "smoke:canary": "tsx --test tests/package-golden-path.spec.ts",
+    "verify:package": "tsx --test tests/package-golden-path.spec.ts",
+    "verify": "pnpm typecheck && pnpm test && pnpm verify:package",
+    "prepack": "pnpm build"
+  },
+  "peerDependencies": {
+    "better-auth": ">=1.6.29 <2"
+  },
+  "dependencies": {
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.1",
+    "@types/node": "22.19.17",
+    "better-auth": "1.6.29",
+    "publint": "0.3.24",
+    "tsdown": "0.22.2",
+    "tsx": "4.23.1",
+    "typescript": "^5.9.3",
+    "vitest": "3.2.4"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/switchfrog/switchfrog-better-auth.git"
+  },
+  "homepage": "https://github.com/switchfrog/switchfrog-better-auth#readme",
+  "bugs": {
+    "url": "https://github.com/switchfrog/switchfrog-better-auth/issues"
+  },
+  "engines": {
+    "node": ">=22.14"
+  },
+  "packageManager": "pnpm@10.34.5"
+}

@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Switchfrog Better Auth example</title>
+  </head>
+  <body>
+    <main>
+      <h1>Switchfrog Better Auth example</h1>
+      <output id="status" aria-live="polite">Loading configuration.</output>
+      <fieldset id="controls" disabled>
+        <legend>Account and organization</legend>
+        <form id="sign-up">
+          <h2>Create account</h2>
+          <label>Name <input id="sign-up-name" name="name" required></label>
+          <label>Email <input id="sign-up-email" name="email" type="email" required></label>
+          <label>Password <input id="sign-up-password" name="password" type="password" minlength="8" required></label>
+          <button type="submit">Create account</button>
+        </form>
+        <form id="sign-in">
+          <h2>Sign in</h2>
+          <label>Email <input id="sign-in-email" name="email" type="email" required></label>
+          <label>Password <input id="sign-in-password" name="password" type="password" required></label>
+          <button type="submit">Sign in</button>
+        </form>
+        <form id="organization">
+          <h2>Create organization</h2>
+          <label>Name <input id="organization-name" name="name" required></label>
+          <label>Slug <input id="organization-slug" name="slug" required></label>
+          <button type="submit">Create organization</button>
+        </form>
+        <form id="active-organization-form">
+          <h2>Active organization</h2>
+          <label>Organization
+            <select id="active-organization" name="organizationId" required>
+              <option value="">Select an organization</option>
+            </select>
+          </label>
+          <button type="submit">Set active organization</button>
+        </form>
+        <button id="sign-out" type="button">Sign out</button>
+      </fieldset>
+    </main>
+    <script type="module" src="/client.js"></script>
+  </body>
+</html>
