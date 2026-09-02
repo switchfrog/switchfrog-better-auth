@@ -641,6 +641,29 @@ test("rejects extra and duplicate package archive members before extraction", ()
   }
 });
 
+test("shared store discovery preserves PNPM_HOME without forwarding credentials", () => {
+  const tempRoot = mkdtempSync(join(tmpdir(), "switchfrog-better-auth-"));
+  const previousHome = process.env.PNPM_HOME;
+  const previousToken = process.env.NODE_AUTH_TOKEN;
+  try {
+    writeFileSync(
+      join(tempRoot, "package.json"),
+      JSON.stringify({ packageManager: packageManifest.packageManager }),
+    );
+    process.env.PNPM_HOME = join(tempRoot, "pnpm");
+    process.env.NODE_AUTH_TOKEN = "sentinel-not-a-credential";
+    assert.equal(findSharedStore(tempRoot), join(tempRoot, "pnpm", "store", "v10"));
+    assert.equal(safeEnvironment(tempRoot).NODE_AUTH_TOKEN, undefined);
+  } finally {
+    if (previousHome === undefined) delete process.env.PNPM_HOME;
+    else process.env.PNPM_HOME = previousHome;
+    if (previousToken === undefined) delete process.env.NODE_AUTH_TOKEN;
+    else process.env.NODE_AUTH_TOKEN = previousToken;
+    assertOwnedTempRoot(tempRoot);
+    rmSync(tempRoot, { force: true, recursive: true });
+  }
+});
+
 test("pack source copying excludes sentinel npm configuration", () => {
   const tempRoot = mkdtempSync(join(tmpdir(), "switchfrog-better-auth-"));
   const sourceRoot = join(tempRoot, "source");
@@ -1792,7 +1815,9 @@ function writeConsumerLockfile(
 }
 
 function findSharedStore(tempRoot: string): string {
-  return runCommand("pnpm", ["store", "path", "--silent"], tempRoot).trim();
+  return runCommand("pnpm", ["store", "path", "--silent"], tempRoot, {
+    PNPM_HOME: process.env.PNPM_HOME,
+  }).trim();
 }
 
 function copyInputTarball(tempRoot: string, inputTarball: string): string {
