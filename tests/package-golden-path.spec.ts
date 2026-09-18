@@ -1091,10 +1091,12 @@ function prepareVerifiedConsumer(
     )}\n`,
   );
   if (configuration.version === defaultVersion) {
-    writeConsumerLockfile(consumerRoot, tarballPath, configuration.version);
+    copyFileSync(join(packageRoot, "pnpm-lock.yaml"), join(consumerRoot, "pnpm-lock.yaml"));
   }
   const installArguments = [
     "install",
+    "--cache-dir",
+    join(tempRoot, "pnpm-cache"),
     "--store-dir",
     configuration.version === defaultVersion
       ? sharedStore
@@ -1102,12 +1104,8 @@ function prepareVerifiedConsumer(
     "--virtual-store-dir",
     join(consumerRoot, "node_modules", ".pnpm"),
   ];
-  installArguments.push(
-    configuration.version === defaultVersion
-      ? "--frozen-lockfile"
-      : "--no-frozen-lockfile",
-  );
-  if (configuration.version === defaultVersion) installArguments.push("--offline");
+  installArguments.push("--no-frozen-lockfile");
+  if (configuration.version === defaultVersion) installArguments.push("--prefer-offline");
   runCommand(
     "pnpm",
     installArguments,
@@ -1510,7 +1508,7 @@ async function verifyChromiumLifecycle(
   await pageA.locator("#sign-in-password").fill(password);
   await pageA.getByRole("button", { name: "Sign in" }).click();
   await waitForCondition(
-    () => upstreamCalls.filter((call) => call.accountId === undefined).length >= 2,
+    () => upstreamCalls.some((call) => call.accountId === undefined && call.sessionFingerprint === anonymousSuccessorFingerprint),
     "authenticated successor association",
   );
   await expect(pageA.locator("#status")).toHaveJSProperty(
@@ -1523,15 +1521,69 @@ async function verifyChromiumLifecycle(
     true,
     "reauthentication must preserve the anonymous successor session",
   );
-  const successorCall = upstreamCalls.filter(
-    (call) => call.accountId === undefined,
-  )[1]!;
+  const successorCall = upstreamCalls.find(
+    (call) => call.accountId === undefined && call.sessionFingerprint === anonymousSuccessorFingerprint,
+  )!;
   assert.equal(
     successorCall.sessionFingerprint === anonymousSuccessorFingerprint,
     true,
     "reauthentication must associate the anonymous successor session",
   );
   assert.equal(successorCall.accepted, true);
+  if (mode.kind === "hermetic") {
+    await pageB.close();
+    await pageA.close();
+    // Earlier tabs can finish server requests after closing; observe this page's requests.
+    const consentPage = await browserContext.newPage();
+    observePage(consentPage, pageErrors);
+    const identifyUrl = `${loopbackOrigin}/api/auth/switchfrog/identify`;
+    let consentRequests = 0;
+    consentPage.on("request", (request) => {
+      if (request.url() === identifyUrl && request.method() === "POST") consentRequests++;
+    });
+    const demoGate = createPendingGate();
+    resources.pendingGate = demoGate;
+    await consentPage.route("https://api.switchfrog.com/sdk/v1.js", async (route) => {
+      await demoGate.promise;
+      await route.fulfill({ body: hostedSdkStub, contentType: "application/javascript" });
+    });
+    await consentPage.goto(`${pageOrigin}/?consent-demo`, { waitUntil: "domcontentloaded" });
+    await waitForExampleReady(consentPage, pageErrors);
+    const permission = consentPage.getByLabel("Collection permission");
+    await expect(permission).toBeVisible();
+    await permission.selectOption("allowed");
+    await permission.selectOption("denied");
+    demoGate.release();
+    await expect(consentPage.locator("#status")).toHaveJSProperty("value", "Collection blocked.");
+    assert.equal(await pageCallCount(consentPage, "start"), 0);
+    assert.equal(await pageCallCount(consentPage, "getSessionToken"), 0);
+    assert.equal(consentRequests, 0, "denied consent must not send an identity request");
+
+    const grantCollection = async () => {
+      const callsBeforeGrant = upstreamCalls.length;
+      const responsePending = consentPage.waitForResponse((response) =>
+        response.url() === identifyUrl && response.request().method() === "POST",
+      );
+      await permission.selectOption("allowed");
+      const response = await responsePending;
+      assert.equal(response.status(), 200);
+      assert.deepEqual(await response.json(), { status: "accepted" });
+      const { sessionToken } = response.request().postDataJSON() as { sessionToken: string };
+      const fingerprint = fingerprintToken(sessionToken);
+      const observed = upstreamCalls.slice(callsBeforeGrant).find((call) => call.sessionFingerprint === fingerprint);
+      assert.ok(observed, "the consent page request must reach the upstream API");
+      assert.equal(observed.accepted, true);
+      return observed;
+    };
+    const firstGranted = await grantCollection();
+    assert.equal(firstGranted.userId, userOnlyCall.userId);
+    await permission.selectOption("denied");
+    await expect(consentPage.locator("#status")).toHaveJSProperty("value", "Collection blocked.");
+    assert.equal(await consentPage.evaluate(() => localStorage.getItem("switchfrog:better-auth:v1:sf_pk_test")), null);
+    const regranted = await grantCollection();
+    assert.equal(regranted.userId, userOnlyCall.userId);
+    assert.notEqual(regranted.sessionFingerprint, firstGranted.sessionFingerprint);
+  }
   assert.equal(pageErrors.length, 0, "browser and authentication errors are forbidden");
 
   if (mode.kind === "production") {
@@ -1566,32 +1618,62 @@ const hostedSdkStub = String.raw`(() => {
   const counterKey = "switchfrog:test:session-counter";
   window.__switchfrogCalls = [];
 
+  let allowed = true;
+  let waitForConsent;
+  const listeners = new Set();
   const record = (type, details = {}) => {
     window.__switchfrogCalls.push({ type, ...details });
   };
   const currentToken = () => {
     let token = localStorage.getItem(tokenKey);
     if (token === null) {
-      token = "sf_session_0";
-      localStorage.setItem(counterKey, "0");
+      const counter = Number(localStorage.getItem(counterKey) ?? "-1") + 1;
+      token = "sf_session_" + counter;
+      localStorage.setItem(counterKey, String(counter));
       localStorage.setItem(tokenKey, token);
     }
     return token;
   };
 
   window.Switchfrog = {
-    init(publishableKey) {
+    init(publishableKey, options) {
+      if (waitForConsent === undefined) {
+        waitForConsent = options?.waitForConsent ?? false;
+        allowed = !waitForConsent;
+      } else if (options?.waitForConsent !== undefined && options.waitForConsent !== waitForConsent) {
+        throw new TypeError("Conflicting waitForConsent");
+      }
       record("init", { publishableKey });
       return {
+        onConsentChange(listener) {
+          listeners.add(listener);
+          listener(allowed);
+          return () => listeners.delete(listener);
+        },
+        async optOut() {
+          if (!allowed) return;
+          allowed = false;
+          for (const listener of [...listeners]) listener(false);
+          localStorage.removeItem(tokenKey);
+        },
+        async optIn() {
+          if (allowed) return;
+          allowed = true;
+          for (const listener of [...listeners]) listener(true);
+          await this.start();
+        },
         async start() {
+          if (!allowed) return;
           record("start", { token: currentToken() });
         },
         async getSessionToken() {
+          if (!allowed) throw new DOMException("Collection is blocked", "NotAllowedError");
           const token = currentToken();
           record("getSessionToken", { token });
           return token;
         },
         async reset() {
+          if (!allowed) return;
           const before = currentToken();
           const counter = Number(localStorage.getItem(counterKey) ?? "0") + 1;
           const after = "sf_session_" + counter;
@@ -1748,70 +1830,6 @@ async function waitForCondition(
     if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`);
     await new Promise<void>((resolve) => setTimeout(resolve, 25));
   }
-}
-
-function writeConsumerLockfile(
-  consumerRoot: string,
-  tarballPath: string,
-  version: string,
-): void {
-  const sourceLockfile = readFileSync(join(packageRoot, "pnpm-lock.yaml"), "utf8");
-  const importersStart = sourceLockfile.indexOf("importers:\n");
-  const packagesStart = sourceLockfile.indexOf("packages:\n");
-  const snapshotsStart = sourceLockfile.indexOf("snapshots:\n");
-  assert.notEqual(importersStart, -1);
-  assert.notEqual(packagesStart, -1);
-  assert.notEqual(snapshotsStart, -1);
-  const sourceImporter = sourceLockfile.slice(importersStart, packagesStart);
-  const escapedVersion = version.replaceAll(".", "\\.");
-  const resolution = sourceImporter.match(
-    new RegExp(
-      `\\n      better-auth:\\n        specifier: ${escapedVersion}\\n        version: (.+)`,
-    ),
-  )?.[1];
-  assert.ok(resolution, `standalone lockfile has no Better Auth ${version} resolution`);
-  const nodeTypesVersion = sourceImporter.match(
-    /\n      '@types\/node':\n        specifier: [^\n]+\n        version: (.+)/,
-  )?.[1];
-  assert.ok(nodeTypesVersion, "standalone lockfile has no @types/node resolution");
-  const relativeTarball = relative(consumerRoot, tarballPath).split(sep).join("/");
-  const fileResolution = `file:${relativeTarball}`;
-  const peerResolution = `better-auth@${resolution}`;
-  const integrity = `sha512-${createHash("sha512")
-    .update(readFileSync(tarballPath))
-    .digest("base64")}`;
-  writeFileSync(
-    join(consumerRoot, "pnpm-lock.yaml"),
-    [
-      sourceLockfile.slice(0, importersStart),
-      "importers:\n\n",
-      "  .:\n",
-      "    dependencies:\n",
-      "      better-auth:\n",
-      `        specifier: ${version}\n`,
-      `        version: ${resolution}\n`,
-      `      '@switchfrog/better-auth':\n`,
-      `        specifier: file:${tarballPath}\n`,
-      `        version: ${fileResolution}(${peerResolution})\n\n`,
-      "    devDependencies:\n",
-      "      '@types/node':\n",
-      `        specifier: ${packageManifest.devDependencies["@types/node"]}\n`,
-      `        version: ${nodeTypesVersion}\n\n`,
-      sourceLockfile.slice(packagesStart, snapshotsStart),
-      `  '@switchfrog/better-auth@${fileResolution}':\n`,
-      `    resolution: {integrity: ${integrity}, tarball: ${fileResolution}}\n`,
-      `    version: ${packageManifest.version}\n`,
-      `    engines: {node: '${packageManifest.engines.node}'}\n`,
-      "    peerDependencies:\n",
-      `      better-auth: '${packageManifest.peerDependencies["better-auth"]}'\n\n`,
-      "snapshots:\n\n",
-      `  '@switchfrog/better-auth@${fileResolution}(${peerResolution})':\n`,
-      "    dependencies:\n",
-      `      better-auth: ${resolution}\n`,
-      `      zod: ${packageManifest.dependencies.zod}\n\n`,
-      sourceLockfile.slice(snapshotsStart + "snapshots:\n".length),
-    ].join(""),
-  );
 }
 
 function findSharedStore(tempRoot: string): string {

@@ -6,10 +6,16 @@ type HostedClient = Readonly<{
   start(): Promise<void>;
   getSessionToken(): Promise<string>;
   reset(): Promise<void>;
+  optIn(): Promise<void>;
+  optOut(): Promise<void>;
+  onConsentChange(listener: (allowed: boolean) => void): () => void;
 }>;
 
 type SwitchfrogGlobal = Readonly<{
-  init(publishableKey: string): HostedClient;
+  init(
+    publishableKey: string,
+    options?: { waitForConsent?: boolean },
+  ): HostedClient;
 }>;
 
 type ClientFetch = Parameters<
@@ -29,6 +35,10 @@ type Synchronizer = {
   activeAssociation?: AbortController;
   authScope: string;
   clientPromise?: Promise<HostedClient>;
+  client?: HostedClient;
+  collectionAllowed?: boolean;
+  pendingResult?: unknown;
+  waitForConsent?: boolean;
   currentDigest?: string;
   fetch: ClientFetch;
   lastAccepted?: Readonly<{ digest: string; sessionToken: string }>;
@@ -38,7 +48,7 @@ type Synchronizer = {
   queue: Promise<void>;
   revision: number;
   started: boolean;
-  storage?: Storage;
+  storage?: Storage | null;
   lastStoredIdentity: string | null;
   storageKey: string;
   store: ClientStore;
@@ -72,7 +82,7 @@ function readStoredState(synchronizer: Synchronizer): StoredIdentityState | null
       synchronizer.storage.getItem(synchronizer.storageKey),
     );
   } catch {
-    synchronizer.storage = undefined;
+    synchronizer.storage = null;
     synchronizer.memoryState = null;
     return null;
   }
@@ -84,7 +94,7 @@ function removeStoredState(synchronizer: Synchronizer): void {
   try {
     synchronizer.storage.removeItem(synchronizer.storageKey);
   } catch {
-    synchronizer.storage = undefined;
+    synchronizer.storage = null;
   }
 }
 
@@ -92,13 +102,14 @@ function writeStoredState(
   synchronizer: Synchronizer,
   value: StoredIdentityState,
 ): void {
+  if (!synchronizer.collectionAllowed) return;
   synchronizer.memoryState = value;
   synchronizer.lastStoredIdentity = identityFromStoredState(value);
   if (!synchronizer.storage) return;
   try {
     synchronizer.storage.setItem(synchronizer.storageKey, value);
   } catch {
-    synchronizer.storage = undefined;
+    synchronizer.storage = null;
   }
 }
 
@@ -155,9 +166,63 @@ async function loadHostedSdk(state: PageState): Promise<SwitchfrogGlobal> {
 function getHostedClient(synchronizer: Synchronizer): Promise<HostedClient> {
   if (synchronizer.clientPromise) return synchronizer.clientPromise;
 
-  const promise = loadHostedSdk(synchronizer.pageState).then((sdk) =>
-    sdk.init(synchronizer.publishableKey),
-  );
+  const promise = loadHostedSdk(synchronizer.pageState).then((sdk) => {
+    const client =
+      synchronizer.waitForConsent === undefined
+        ? sdk.init(synchronizer.publishableKey)
+        : sdk.init(synchronizer.publishableKey, {
+            waitForConsent: synchronizer.waitForConsent,
+          });
+    for (const method of [
+      "start",
+      "reset",
+      "getSessionToken",
+      "optIn",
+      "optOut",
+      "onConsentChange",
+    ] as const) {
+      if (typeof client?.[method] !== "function") {
+        throw new TypeError(
+          "Upgrade the hosted Switchfrog SDK and reload before using Better Auth consent support",
+        );
+      }
+    }
+    synchronizer.client = client;
+    client.onConsentChange((allowed) => {
+      const previous = synchronizer.collectionAllowed;
+      if (previous === allowed) return;
+      synchronizer.collectionAllowed = allowed;
+      advanceRevision(synchronizer);
+      synchronizer.pendingResult = undefined;
+      synchronizer.queue = Promise.resolve();
+      synchronizer.currentDigest = undefined;
+      synchronizer.lastAccepted = undefined;
+      synchronizer.lastStoredIdentity = null;
+      synchronizer.memoryState = null;
+      synchronizer.unhashableIdentityKey = undefined;
+      synchronizer.started = false;
+      if (!allowed) {
+        if (previous !== undefined) removeStoredState(synchronizer);
+        return;
+      }
+      if (synchronizer.storage === undefined) {
+        try {
+          synchronizer.storage = window.localStorage;
+        } catch {
+          synchronizer.storage = null;
+        }
+      }
+      synchronizer.lastStoredIdentity = identityFromStoredState(
+        readStoredState(synchronizer),
+      );
+      if (previous === undefined) {
+        queueIdentity(synchronizer, synchronizer.store.atoms.session.get());
+      } else {
+        synchronizer.store.notify("$sessionSignal");
+      }
+    });
+    return client;
+  });
   synchronizer.clientPromise = promise;
   void promise.catch(() => {
     if (synchronizer.clientPromise === promise) {
@@ -220,13 +285,18 @@ function isCurrent(
   digest?: string,
   storedState?: StoredIdentityState | null,
 ): boolean {
+  // The public snapshot refreshes canonical permission, including missed storage events.
+  synchronizer.client?.onConsentChange(() => {})();
   if (
+    !synchronizer.collectionAllowed ||
     synchronizer.revision !== revision ||
     (digest !== undefined && synchronizer.currentDigest !== digest)
   ) {
     return false;
   }
-  return storedState === undefined || readStoredState(synchronizer) === storedState;
+  return (
+    storedState === undefined || readStoredState(synchronizer) === storedState
+  );
 }
 
 function advanceRevision(synchronizer: Synchronizer): number {
@@ -239,8 +309,9 @@ async function startIfNeeded(
   client: HostedClient,
 ): Promise<void> {
   if (synchronizer.started) return;
+  const revision = synchronizer.revision;
   await client.start();
-  synchronizer.started = true;
+  if (isCurrent(synchronizer, revision)) synchronizer.started = true;
 }
 
 async function associateIdentity(
@@ -269,6 +340,18 @@ async function associateIdentity(
         method: "POST",
         body: { sessionToken, expectedIdentityDigest: digest },
         signal: controller.signal,
+        // Better Fetch appends request-local hooks after all configured host hooks.
+        plugins: [{
+          id: "switchfrog-consent",
+          name: "Switchfrog consent",
+          hooks: {
+            onRequest(request) {
+              if (!isCurrent(synchronizer, revision, digest, expectedState)) controller.abort();
+              controller.signal.throwIfAborted();
+              return { ...request, signal: controller.signal };
+            },
+          },
+        }],
         throw: false,
       });
     } catch (error) {
@@ -280,7 +363,11 @@ async function associateIdentity(
       }
     }
   })();
-  if (response === null) return;
+  if (
+    response === null ||
+    !isCurrent(synchronizer, revision, digest, expectedState)
+  )
+    return;
   const { data, error } = response;
   if (
     error?.status === 412 &&
@@ -290,8 +377,6 @@ async function associateIdentity(
     synchronizer.store.notify("$sessionSignal");
     return;
   }
-  if (!isCurrent(synchronizer, revision, digest, expectedState)) return;
-
   if (
     error === null &&
     typeof data === "object" &&
@@ -338,14 +423,13 @@ async function associateIdentity(
 async function syncUnhashableIdentity(
   synchronizer: Synchronizer,
   revision: number,
-  clientPromise: Promise<HostedClient>,
+  client: HostedClient,
   identityKey: string,
 ): Promise<void> {
   if (
     synchronizer.unhashableIdentityKey === identityKey &&
     readStoredState(synchronizer) === null
   ) {
-    const client = await clientPromise;
     if (isCurrent(synchronizer, revision)) {
       await startIfNeeded(synchronizer, client);
     }
@@ -354,7 +438,6 @@ async function syncUnhashableIdentity(
 
   removeStoredState(synchronizer);
   synchronizer.lastAccepted = undefined;
-  const client = await clientPromise;
   if (!isCurrent(synchronizer, revision, undefined, null)) return;
   await client.reset();
   if (!isCurrent(synchronizer, revision, undefined, null)) return;
@@ -364,13 +447,13 @@ async function syncUnhashableIdentity(
 
 async function syncIdentity(
   synchronizer: Synchronizer,
-  result: unknown,
   revision: number,
 ): Promise<void> {
-  if (synchronizer.revision !== revision) return;
-  const identity = resolveIdentity(result);
+  const client = synchronizer.client;
+  if (!client || !isCurrent(synchronizer, revision)) return;
+  const identity = resolveIdentity(synchronizer.pendingResult);
+  synchronizer.pendingResult = undefined;
   if (!identity) return;
-  const clientPromise = getHostedClient(synchronizer);
 
   if (identity.kind === "anonymous") {
     synchronizer.currentDigest = undefined;
@@ -379,7 +462,6 @@ async function syncIdentity(
     if (storedState !== "anonymous") {
       removeStoredState(synchronizer);
       synchronizer.lastAccepted = undefined;
-      const client = await clientPromise;
       if (!isCurrent(synchronizer, revision, undefined, null)) return;
       await client.reset();
       if (!isCurrent(synchronizer, revision, undefined, null)) return;
@@ -387,7 +469,6 @@ async function syncIdentity(
       await startIfNeeded(synchronizer, client);
       return;
     }
-    const client = await clientPromise;
     if (!isCurrent(synchronizer, revision, undefined, "anonymous")) return;
     await startIfNeeded(synchronizer, client);
     return;
@@ -397,33 +478,32 @@ async function syncIdentity(
     await syncUnhashableIdentity(
       synchronizer,
       revision,
-      clientPromise,
+      client,
       JSON.stringify([identity.userId, identity.accountId]),
     );
     return;
   }
 
   synchronizer.unhashableIdentityKey = undefined;
-  const digest = await computeIdentityDigest(identity.userId, identity.accountId);
-  if (synchronizer.revision !== revision) return;
+  const digest = await computeIdentityDigest(
+    identity.userId,
+    identity.accountId,
+  );
+  if (!isCurrent(synchronizer, revision)) return;
   synchronizer.currentDigest = digest;
   const storedState = readStoredState(synchronizer);
   const acceptedState = `accepted:${digest}` as const;
   const unassociatedState = `unassociated:${digest}` as const;
   let associationState: typeof acceptedState | typeof unassociatedState;
-  let client: HostedClient;
 
   if (storedState === "anonymous") {
     associationState = unassociatedState;
     writeStoredState(synchronizer, associationState);
-    client = await clientPromise;
   } else if (storedState === acceptedState || storedState === unassociatedState) {
     associationState = storedState;
-    client = await clientPromise;
   } else {
     removeStoredState(synchronizer);
     synchronizer.lastAccepted = undefined;
-    client = await clientPromise;
     if (!isCurrent(synchronizer, revision, digest, null)) return;
     await client.reset();
     if (!isCurrent(synchronizer, revision, digest, null)) return;
@@ -444,9 +524,32 @@ async function syncIdentity(
   );
 }
 
+function queueIdentity(synchronizer: Synchronizer, result: unknown): void {
+  if (!synchronizer.collectionAllowed) return;
+  synchronizer.currentDigest = undefined;
+  synchronizer.pendingResult = result;
+  const revision = advanceRevision(synchronizer);
+  synchronizer.queue = synchronizer.queue
+    .then(() => syncIdentity(synchronizer, revision))
+    .catch((error: unknown) => {
+      if (
+        error instanceof Error &&
+        (error.name === "AbortError" || error.name === "NotAllowedError")
+      )
+        return;
+      console.error("Switchfrog Better Auth identity synchronization failed");
+    });
+}
+
 export function switchfrogClient(
-  options: Readonly<{ publishableKey: string }>,
+  options: Readonly<{ publishableKey: string; waitForConsent?: boolean }>,
 ): BetterAuthClientPlugin {
+  if (
+    options.waitForConsent !== undefined &&
+    typeof options.waitForConsent !== "boolean"
+  ) {
+    throw new TypeError("waitForConsent must be a boolean");
+  }
   const publishableKey = options.publishableKey.trim();
   if (!publishableKey.startsWith("sf_pk_") || publishableKey.length === 6) {
     throw new TypeError("publishableKey must be a Switchfrog publishable key");
@@ -469,48 +572,59 @@ export function switchfrogClient(
       ]);
       const existing = state.synchronizersByPublishableKey.get(publishableKey);
       if (existing) {
+        if (options.waitForConsent !== undefined) {
+          const sdk = installedGlobal();
+          if (
+            (existing.waitForConsent !== undefined || !sdk) &&
+            options.waitForConsent !== (existing.waitForConsent ?? false)
+          ) {
+            throw new TypeError(
+              "Switchfrog Better Auth waitForConsent conflicts with its existing configuration",
+            );
+          }
+          sdk?.init(publishableKey, { waitForConsent: options.waitForConsent });
+        }
         if (existing.authScope !== authScope) {
           console.error("Switchfrog Better Auth client already owns this publishable key");
         }
         return {};
       }
 
-      let storage: Storage | undefined;
-      try {
-        storage = window.localStorage;
-      } catch {
-        // Page memory is the safe fallback when durable storage is unavailable.
-      }
       const synchronizer: Synchronizer = {
         authScope,
         fetch: $fetch,
+        waitForConsent: options.waitForConsent,
         memoryState: null,
         pageState: state,
         publishableKey,
         queue: Promise.resolve(),
         revision: 0,
         started: false,
-        storage,
         lastStoredIdentity: null,
         storageKey: `switchfrog:better-auth:v1:${publishableKey}`,
         store: $store,
       };
-      synchronizer.lastStoredIdentity = identityFromStoredState(
-        readStoredState(synchronizer),
-      );
       state.synchronizersByPublishableKey.set(publishableKey, synchronizer);
-      void getHostedClient(synchronizer).catch((error) =>
-        console.error("Switchfrog Better Auth client failed to initialize", error),
-      );
       $store.atoms.session.subscribe((result) => {
-        synchronizer.currentDigest = undefined;
-        const revision = advanceRevision(synchronizer);
-        synchronizer.queue = synchronizer.queue
-          .then(() => syncIdentity(synchronizer, result, revision))
-          .catch(() => console.error("Switchfrog Better Auth identity synchronization failed"));
+        if (!synchronizer.client) {
+          synchronizer.queue = getHostedClient(synchronizer)
+            .then(() => undefined)
+            .catch((error) =>
+              console.error(
+                "Switchfrog Better Auth client failed to initialize",
+                error,
+              ),
+            );
+          return;
+        }
+        queueIdentity(synchronizer, result);
       });
       window.addEventListener?.("storage", (event) => {
-        if (event.key !== synchronizer.storageKey) return;
+        if (
+          !synchronizer.collectionAllowed ||
+          event.key !== synchronizer.storageKey
+        )
+          return;
         advanceRevision(synchronizer);
         const nextState = parseStoredIdentityState(event.newValue);
         const nextIdentity = identityFromStoredState(nextState);

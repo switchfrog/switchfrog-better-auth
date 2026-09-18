@@ -39,10 +39,51 @@ async function bootstrap(): Promise<void> {
     throw new Error("Configuration is invalid.");
   }
 
+  const consentDemo = new URLSearchParams(location.search).has("consent-demo");
+  const permission = document.querySelector<HTMLSelectElement>("#collection-permission")!;
+  const applyPermission = async () => {
+    const sdk = (window as Window & {
+      Switchfrog?: {
+        init(key: string, options: { waitForConsent: boolean }): {
+          optIn(): Promise<void>;
+          optOut(): Promise<void>;
+        };
+      };
+    }).Switchfrog;
+    if (!sdk || !permission.value) return;
+    // Read the current choice now, including after the hosted script has loaded.
+    const allowed = permission.value === "allowed";
+    try {
+      const client = sdk.init(publishableKey, { waitForConsent: true });
+      await (allowed ? client.optIn() : client.optOut());
+      if ((permission.value === "allowed") === allowed) {
+        setStatus(allowed ? "Collection allowed." : "Collection blocked.");
+      }
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") return;
+      setStatus(error instanceof Error ? error.message : "Consent update failed.");
+    }
+  };
+  if (consentDemo) {
+    document.querySelector<HTMLFieldSetElement>("#consent-demo")!.hidden = false;
+    permission.addEventListener("change", applyPermission);
+  }
   const auth = createAuthClient({
     baseURL: `${location.origin}/api/auth`,
-    plugins: [organizationClient(), switchfrogClient({ publishableKey })],
+    plugins: [
+      organizationClient(),
+      switchfrogClient({ publishableKey, ...(consentDemo ? { waitForConsent: true } : {}) }),
+    ],
   });
+  if (consentDemo) {
+    const applyAfterLoad = () => {
+      // Let the adapter subscribe before applying the latest CMP decision.
+      setTimeout(applyPermission, 0);
+    };
+    document.querySelector<HTMLScriptElement>('script[src="https://api.switchfrog.com/sdk/v1.js"]')
+      ?.addEventListener("load", applyAfterLoad, { once: true });
+    applyAfterLoad();
+  }
   const organizationApi = auth.organization as unknown as {
     create(options: Readonly<{
       keepCurrentActiveOrganization: boolean;
