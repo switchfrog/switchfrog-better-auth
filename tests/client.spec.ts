@@ -1,4 +1,7 @@
+import { createRequire } from "node:module";
+
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 
 import { switchfrogClient } from "../src/client";
 
@@ -124,7 +127,10 @@ function installDom(options: { localStorage?: Storage; localStorageError?: Error
   const window = {
     addEventListener(
       type: string,
-      listener: (event: { key: null | string; newValue: null | string }) => void,
+      listener: (event: {
+        key: null | string;
+        newValue: null | string;
+      }) => void,
     ) {
       if (type === "storage") storageListeners.push(listener);
     },
@@ -177,6 +183,7 @@ function createSessionAtom(initial: SessionResult) {
   let current = initial;
   const listeners = new Set<(result: SessionResult) => void>();
   return {
+    get: () => current,
     emit(result: SessionResult) {
       current = result;
       for (const listener of listeners) listener(result);
@@ -215,7 +222,10 @@ function rejectOnAbort(signal?: AbortSignal): Promise<EndpointResult> {
 function getActions(
   publishableKey: string,
   options?: { basePath?: string; baseURL?: string },
-  dependencies?: { $fetch?: ReturnType<typeof vi.fn>; $store?: ReturnType<typeof createStore>["store"] },
+  dependencies?: {
+    $fetch?: ReturnType<typeof vi.fn>;
+    $store?: ReturnType<typeof createStore>["store"];
+  },
 ) {
   const plugin = switchfrogClient({ publishableKey });
   const $fetch = dependencies?.$fetch ?? vi.fn(async () => ({ data: null, error: null }));
@@ -255,6 +265,9 @@ function installSynchronizer(options: {
   start?: Promise<void>;
   storage?: TestStorage;
   tokens?: Array<Awaitable<string>>;
+  allowed?: boolean;
+  waitForConsent?: boolean;
+  fetch?: ReturnType<typeof vi.fn>;
 }) {
   const calls: string[] = [];
   const storage = options.storage ?? createStorage(calls);
@@ -264,7 +277,24 @@ function installSynchronizer(options: {
     localStorageError: options.localStorageError,
   });
   const tokens = [...(options.tokens ?? ["token-a"])];
+  let allowed = options.allowed ?? true;
+  const consentListeners = new Set<(allowed: boolean) => void>();
   const client = {
+    onConsentChange: vi.fn((listener: (allowed: boolean) => void) => {
+      consentListeners.add(listener);
+      listener(allowed);
+      return () => {
+        consentListeners.delete(listener);
+      };
+    }),
+    optIn: vi.fn(async () => {
+      allowed = true;
+      for (const listener of [...consentListeners]) listener(allowed);
+    }),
+    optOut: vi.fn(async () => {
+      allowed = false;
+      for (const listener of [...consentListeners]) listener(allowed);
+    }),
     getSessionToken: vi.fn(async () => {
       const token = await (tokens.shift() ?? "token-a");
       calls.push(`token:${token}`);
@@ -315,7 +345,17 @@ function installSynchronizer(options: {
     },
   );
 
-  getActions("sf_pk_test", undefined, { $fetch, $store: store });
+  const plugin = switchfrogClient({
+    publishableKey: "sf_pk_test",
+    ...(options.waitForConsent === undefined
+      ? {}
+      : { waitForConsent: options.waitForConsent }),
+  });
+  plugin.getActions?.(
+    (options.fetch ?? $fetch) as never,
+    store as never,
+    {},
+  );
 
   return { $fetch, calls, client, dispatchStorage, session, storage, store, window };
 }
@@ -433,6 +473,12 @@ describe("switchfrogClient", () => {
   it("reuses an existing valid hosted SDK global", async () => {
     const { scripts, window } = installDom();
     const init = vi.fn(() => ({
+      onConsentChange: (listener: (allowed: boolean) => void) => {
+        listener(true);
+        return () => undefined;
+      },
+      optIn: async () => undefined,
+      optOut: async () => undefined,
       getSessionToken: async () => "sf_session",
       reset: async () => undefined,
       start: async () => undefined,
@@ -447,12 +493,14 @@ describe("switchfrogClient", () => {
   });
 
   it("removes only its failed script when load completes without a valid global", async () => {
-    const { scripts } = installDom();
-    const report = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const { scripts, window } = installDom();
+    const report = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
 
     getActions("sf_pk_test");
     scripts[0]?.onload?.();
-    await settle();
+    await drain(window);
 
     expect(scripts[0]?.removed).toBe(true);
     expect(report).toHaveBeenCalledWith(
@@ -477,6 +525,12 @@ describe("switchfrogClient", () => {
     );
 
     const init = vi.fn(() => ({
+      onConsentChange: (listener: (allowed: boolean) => void) => {
+        listener(true);
+        return () => undefined;
+      },
+      optIn: async () => undefined,
+      optOut: async () => undefined,
       getSessionToken: async () => "sf_session",
       reset: async () => undefined,
       start: async () => undefined,
@@ -1222,4 +1276,436 @@ describe("switchfrogClient", () => {
     expect(installed.storage.values.get(storageKey)).toBe(`unassociated:${digestA}`);
     expect(installed.$fetch).toHaveBeenCalledOnce();
   });
+});
+
+describe("Better Auth collection permission", () => {
+  it("holds before digest storage, hashing, startup and auth snapshots", async () => {
+    const storage = createStorage();
+    const read = vi.spyOn(storage.storage, "getItem");
+    const hash = vi.spyOn(crypto.subtle, "digest");
+    const installed = installSynchronizer({
+      initial: authenticated("user-a"),
+      allowed: false,
+      waitForConsent: true,
+      storage,
+    });
+    await drain(installed.window);
+    installed.session.emit(authenticated("user-b"));
+    await drain(installed.window);
+    expect(read).not.toHaveBeenCalled();
+    expect(hash).not.toHaveBeenCalled();
+    expect(installed.calls).toEqual([]);
+    expect(installed.window.Switchfrog?.init).toHaveBeenCalledWith(
+      "sf_pk_test",
+      {
+        waitForConsent: true,
+      },
+    );
+  });
+
+  it("validates old hosted capabilities before digest work", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const storage = createStorage();
+    const read = vi.spyOn(storage.storage, "getItem");
+    const hash = vi.spyOn(crypto.subtle, "digest");
+    const { window } = installDom({ localStorage: storage.storage });
+    const start = vi.fn();
+    window.Switchfrog = {
+      init: () => ({ start, reset: vi.fn(), getSessionToken: vi.fn() }),
+    };
+    getActions("sf_pk_test", undefined, {
+      $store: createStore(authenticated("user-a")).store,
+    });
+    await drain(window);
+    expect(read).not.toHaveBeenCalled();
+    expect(hash).not.toHaveBeenCalled();
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  it.each(["user-a", "user-b", null])(
+    "rereads current auth on grant: %s",
+    async (currentUser) => {
+      let installed!: ReturnType<typeof installSynchronizer>;
+      installed = installSynchronizer({
+        initial: authenticated("user-a"),
+        notify: () =>
+          installed.session.emit(
+            currentUser === null ? anonymous() : authenticated(currentUser),
+          ),
+        tokens: ["token-a", "token-new"],
+      });
+      await drain(installed.window);
+      await installed.client.optOut();
+      expect(installed.storage.values.has(storageKey)).toBe(false);
+      installed.session.emit(authenticated("discard-me"));
+      await drain(installed.window);
+      installed.calls.length = 0;
+      await installed.client.optIn();
+      await drain(installed.window);
+      expect(installed.store.notify).toHaveBeenCalledExactlyOnceWith(
+        "$sessionSignal",
+      );
+      expect(installed.storage.values.get(storageKey)).toBe(
+        currentUser === null
+          ? "anonymous"
+          : `accepted:${currentUser === "user-a" ? digestA : digestB}`,
+      );
+      expect(installed.calls).not.toContain(`identify:${digestA}:token-a`);
+      expect(installed.calls).toContain("start");
+    },
+  );
+
+  it("discards an old token and queued auth snapshot on withdrawal", async () => {
+    const token = deferred<string>();
+    const installed = installSynchronizer({
+      initial: authenticated("user-a"),
+      priorState: `accepted:${digestA}`,
+      tokens: [token.promise],
+    });
+    await vi.waitFor(() =>
+      expect(installed.client.getSessionToken).toHaveBeenCalledOnce(),
+    );
+    installed.session.emit(authenticated("user-b"));
+    await installed.client.optOut();
+    expect(getPageState(installed.window).synchronizersByPublishableKey.get("sf_pk_test")).toMatchObject({
+      pendingResult: undefined,
+      currentDigest: undefined,
+      lastAccepted: undefined,
+      lastStoredIdentity: null,
+      memoryState: null,
+      unhashableIdentityKey: undefined,
+      started: false,
+    });
+    token.resolve("token-old");
+    await drain(installed.window);
+    await settle();
+    expect(installed.$fetch).not.toHaveBeenCalled();
+    expect(installed.storage.values.has(storageKey)).toBe(false);
+  });
+
+  it.each([200, 412, 403, 409])(
+    "discards a late %s response after withdrawal",
+    async (status) => {
+      const response = deferred<EndpointResult>();
+      const installed = installSynchronizer({
+        initial: authenticated("user-a"),
+        responses: [response.promise],
+      });
+      await vi.waitFor(() => expect(installed.$fetch).toHaveBeenCalledOnce());
+      const signal = installed.$fetch.mock.calls[0]?.[1].signal;
+      await installed.client.optOut();
+      response.resolve(
+        status === 200
+          ? { data: { status: "accepted" }, error: null }
+          : {
+              data: null,
+              error: {
+                status,
+                code:
+                  status === 412
+                    ? "SWITCHFROG_IDENTITY_CHANGED"
+                    : "SWITCHFROG_SESSION_REINIT_REQUIRED",
+              },
+            },
+      );
+      await settle();
+      await drain(installed.window);
+      expect(signal?.aborted).toBe(true);
+      expect(installed.store.notify).not.toHaveBeenCalled();
+      expect(installed.storage.values.has(storageKey)).toBe(false);
+      expect(installed.$fetch).toHaveBeenCalledOnce();
+    },
+  );
+
+  it.each(["request", "retry", "canonical request"])(
+    "blocks actual Better Fetch dispatch after delayed %s hooks",
+    async (phase) => {
+      const require = createRequire(import.meta.url);
+      const betterFetchPath = createRequire(
+        require.resolve("better-auth/client"),
+      ).resolve("@better-fetch/fetch");
+      const { createFetch } = await import(betterFetchPath);
+      const gate = deferred<void>();
+      const entered = vi.fn();
+      const network = vi.fn(async (_url: unknown, options: RequestInit) => {
+        options.signal?.throwIfAborted();
+        return Response.json({ error: "retry" }, { status: 503 });
+      });
+      const fetchOptions = {
+        customFetchImpl: network,
+        retry: { type: "linear", attempts: 1, delay: 0 },
+        ...(phase !== "retry"
+          ? {
+              plugins: [
+                {
+                  id: "delay",
+                  name: "delay",
+                  hooks: {
+                    onRequest: async () => {
+                      entered();
+                      await gate.promise;
+                    },
+                  },
+                },
+              ],
+            }
+          : {
+              onRetry: async () => {
+                entered();
+                await gate.promise;
+              },
+            }),
+      };
+      const $fetch = vi.fn(
+        createFetch({ baseURL: "https://auth.example", ...fetchOptions }),
+      );
+      const installed = installSynchronizer({
+        initial: authenticated("user-a"),
+        fetch: $fetch,
+      });
+      await vi.waitFor(() => expect(entered).toHaveBeenCalledOnce());
+      if (phase === "canonical request") {
+        // Model a missed storage event discovered by the SDK's next public snapshot.
+        installed.client.onConsentChange.mockImplementationOnce((listener) => {
+          void installed.client.optOut();
+          listener(false);
+          return () => undefined;
+        });
+      } else {
+        await installed.client.optOut();
+      }
+      gate.resolve();
+      await drain(installed.window);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(network).toHaveBeenCalledTimes(phase === "retry" ? 1 : 0);
+      expect(installed.storage.values.has(storageKey)).toBe(false);
+    },
+  );
+});
+
+describe("Better Auth permission races", () => {
+  it("retains the digest cache format after an initial wait and fresh auth read", async () => {
+    let installed!: ReturnType<typeof installSynchronizer>;
+    installed = installSynchronizer({
+      initial: authenticated("stale-user"),
+      allowed: false,
+      waitForConsent: true,
+      priorState: `accepted:${digestA}`,
+      notify: () => installed.session.emit(authenticated("user-a")),
+      tokens: ["token-new"],
+    });
+    await drain(installed.window);
+    await installed.client.optIn();
+    await drain(installed.window);
+    expect(installed.calls).toContain(`identify:${digestA}:token-new`);
+    expect(installed.calls).toContain(`write:accepted:${digestA}`);
+    expect(installed.client.reset).not.toHaveBeenCalled();
+  });
+
+  it("regrants without waiting for or replaying a revoked digest computation", async () => {
+    const hash = deferred<ArrayBuffer>();
+    const digest = vi
+      .spyOn(crypto.subtle, "digest")
+      .mockImplementationOnce(() => hash.promise);
+    let installed!: ReturnType<typeof installSynchronizer>;
+    installed = installSynchronizer({
+      initial: authenticated("user-a"),
+      notify: () => installed.session.emit(authenticated("user-b")),
+    });
+    await vi.waitFor(() => expect(digest).toHaveBeenCalledOnce());
+    await installed.client.optOut();
+    await installed.client.optIn();
+    await drain(installed.window);
+    expect(installed.storage.values.get(storageKey)).toBe(
+      `accepted:${digestB}`,
+    );
+    hash.resolve(new Uint8Array(32).buffer);
+    await settle();
+    expect(installed.$fetch).toHaveBeenCalledOnce();
+    expect(installed.storage.values.get(storageKey)).toBe(
+      `accepted:${digestB}`,
+    );
+  });
+
+  it("suppresses expected cancellation but still reports unrelated startup failures", async () => {
+    const report = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const cancelled = Promise.reject(
+      new DOMException("superseded", "AbortError"),
+    );
+    void cancelled.catch(() => undefined);
+    const installed = installSynchronizer({
+      initial: anonymous(),
+      start: cancelled,
+    });
+    await drain(installed.window);
+    expect(report).not.toHaveBeenCalled();
+    installed.client.start.mockRejectedValueOnce(new Error("unexpected"));
+    installed.session.emit(anonymous());
+    await drain(installed.window);
+    expect(report).toHaveBeenCalledOnce();
+  });
+
+  it("rejects conflicting explicit repeated configuration while allowing omitted reuse", async () => {
+    const installed = installSynchronizer({
+      initial: pending(),
+      allowed: false,
+      waitForConsent: true,
+    });
+    await drain(installed.window);
+    expect(() => getActions("sf_pk_test")).not.toThrow();
+    expect(() =>
+      switchfrogClient({
+        publishableKey: "sf_pk_test",
+        waitForConsent: true,
+      }).getActions?.(vi.fn() as never, createStore().store as never, {}),
+    ).not.toThrow();
+    expect(() =>
+      switchfrogClient({
+        publishableKey: "sf_pk_test",
+        waitForConsent: false,
+      }).getActions?.(vi.fn() as never, createStore().store as never, {}),
+    ).toThrow(TypeError);
+    expect(() =>
+      switchfrogClient({
+        publishableKey: "sf_pk_test",
+        waitForConsent: "true" as never,
+      }),
+    ).toThrow(TypeError);
+  });
+});
+
+describe("Better Auth inherited SDK configuration", () => {
+  it("validates explicit reuse against a held SDK originally reused with omitted options", async () => {
+    const installed = installSynchronizer({ initial: pending(), allowed: false });
+    await drain(installed.window);
+    installed.window.Switchfrog = {
+      init: (_key: string, options?: { waitForConsent?: boolean }) => {
+        if (options?.waitForConsent === false) throw new TypeError("conflicting SDK configuration");
+        return installed.client;
+      },
+    };
+    const apply = (waitForConsent: boolean) => switchfrogClient({ publishableKey: "sf_pk_test", waitForConsent }).getActions?.(vi.fn() as never, createStore().store as never, {});
+    expect(() => apply(false)).toThrow(TypeError);
+    expect(() => apply(true)).not.toThrow();
+  });
+});
+
+
+it("does not mark a withdrawn synchronizer started when old startup resolves", async () => {
+  const start = deferred<void>();
+  const installed = installSynchronizer({ initial: authenticated("user-a"), start: start.promise });
+  await vi.waitFor(() => expect(installed.client.start).toHaveBeenCalledOnce());
+  await installed.client.optOut();
+  start.resolve();
+  await settle();
+  expect(getPageState(installed.window).synchronizersByPublishableKey.get("sf_pk_test")).toMatchObject({ started: false });
+  expect(installed.client.getSessionToken).not.toHaveBeenCalled();
+  expect(installed.storage.values.has(storageKey)).toBe(false);
+});
+
+it("keeps the adapter in memory after digest-storage failure and regrant", async () => {
+  const storage = createStorage();
+  const read = vi.spyOn(storage.storage, "getItem").mockImplementationOnce(() => { throw new DOMException("blocked", "SecurityError"); });
+  const write = vi.spyOn(storage.storage, "setItem");
+  let installed!: ReturnType<typeof installSynchronizer>;
+  installed = installSynchronizer({ initial: authenticated("user-a"), storage, notify: () => installed.session.emit(authenticated("user-b")) });
+  await drain(installed.window);
+  await installed.client.optOut();
+  await installed.client.optIn();
+  await drain(installed.window);
+  expect(read).toHaveBeenCalledOnce();
+  expect(write).not.toHaveBeenCalled();
+  expect(getPageState(installed.window).synchronizersByPublishableKey.get("sf_pk_test")).toMatchObject({ memoryState: `accepted:${digestB}` });
+});
+
+it.each([
+  { phase: "request", allowed: false, dispatches: 0 },
+  { phase: "request", allowed: true, dispatches: 1 },
+  { phase: "retry", allowed: true, dispatches: 2 },
+  { phase: "retry", allowed: false, dispatches: 1 },
+])(
+  "guards the host plugin's $phase boundary (allowed=$allowed)",
+  async ({ phase, allowed, dispatches }) => {
+    const require = createRequire(import.meta.url);
+    const { createFetch } = await import(
+      createRequire(require.resolve("better-auth/client")).resolve("@better-fetch/fetch")
+    );
+    const gate = deferred<void>();
+    const entered = vi.fn();
+    const fallback = vi.fn();
+    const selectedTransport = vi.fn(async function (this: unknown, _url: unknown, request: RequestInit) {
+      expect(this).toBeUndefined();
+      request.signal?.throwIfAborted();
+      return Response.json({ status: "accepted" }, { status: phase === "retry" ? 503 : 200 });
+    });
+    const fetchOptions = {
+      customFetchImpl: fallback,
+      retry: { type: "linear", attempts: 1, delay: 0 },
+      plugins: [{
+        id: "host-transport",
+        name: "Host transport",
+        init: (url: string, options: Record<string, unknown>) => {
+          options.customFetchImpl = selectedTransport;
+          return { url, options };
+        },
+        hooks: {
+          onRequest: async (request: RequestInit) => {
+            if (phase === "request") { entered(); await gate.promise; }
+            return { ...request, signal: new AbortController().signal };
+          },
+          onRetry: async () => {
+            if (phase === "retry") { entered(); await gate.promise; }
+          },
+        },
+      }],
+    };
+    const $fetch = vi.fn(createFetch({ baseURL: "https://auth.example", ...fetchOptions }));
+    const installed = installSynchronizer({ initial: authenticated("user-a"), fetch: $fetch });
+    await vi.waitFor(() => expect(entered).toHaveBeenCalledOnce());
+    if (!allowed) {
+      installed.client.onConsentChange.mockImplementationOnce((listener) => {
+        void installed.client.optOut();
+        listener(false);
+        return () => undefined;
+      });
+    }
+    gate.resolve();
+    await drain(installed.window);
+    expect(selectedTransport).toHaveBeenCalledTimes(dispatches);
+    expect(fallback).not.toHaveBeenCalled();
+    const originalRequest = $fetch.mock.calls[0]?.[1] as { signal?: AbortSignal };
+    for (const [, request] of selectedTransport.mock.calls) {
+      expect(request.signal).toBe(originalRequest.signal);
+    }
+    if (allowed && phase === "request") expect(installed.storage.values.get(storageKey)).toBe(`accepted:${digestA}`);
+  },
+);
+
+
+it("preserves configured Better Fetch schema transformations", async () => {
+  const require = createRequire(import.meta.url);
+  const { createFetch, createSchema } = await import(
+    createRequire(require.resolve("better-auth/client")).resolve("@better-fetch/fetch")
+  );
+  const bodies: unknown[] = [];
+  const transport = vi.fn(async (_url: unknown, request: RequestInit) => {
+    bodies.push(JSON.parse(String(request.body)));
+    return Response.json({ status: "accepted" });
+  });
+  const fetchOptions = {
+    customFetchImpl: transport,
+    schema: createSchema({
+      "/switchfrog/identify": {
+        input: z.object({ sessionToken: z.string(), expectedIdentityDigest: z.string() })
+          .transform((body) => ({ ...body, schemaApplied: true })),
+      },
+    }),
+  };
+  const $fetch = vi.fn(createFetch({ baseURL: "https://auth.example", ...fetchOptions }));
+  const installed = installSynchronizer({ initial: authenticated("user-a"), fetch: $fetch });
+  await drain(installed.window);
+  expect(bodies).toEqual([{ sessionToken: "token-a", expectedIdentityDigest: digestA, schemaApplied: true }]);
+  expect(installed.storage.values.get(storageKey)).toBe(`accepted:${digestA}`);
 });

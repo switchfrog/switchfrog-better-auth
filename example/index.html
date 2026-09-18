@@ -4,11 +4,23 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Switchfrog Better Auth example</title>
+    <style>label { display: inline-block; }</style>
   </head>
   <body>
     <main>
       <h1>Switchfrog Better Auth example</h1>
       <output id="status" aria-live="polite">Loading configuration.</output>
+      <fieldset id="consent-demo" hidden>
+        <legend>Consent bridge demo</legend>
+        <p>This selector stands in for a CMP decision. It is not consent evidence.</p>
+        <label>Collection permission
+          <select id="collection-permission">
+            <option value="" disabled selected>No decision yet</option>
+            <option value="allowed">Allow</option>
+            <option value="denied">Deny or withdraw</option>
+          </select>
+        </label>
+      </fieldset>
       <fieldset id="controls" disabled>
         <legend>Account and organization</legend>
         <form id="sign-up">
